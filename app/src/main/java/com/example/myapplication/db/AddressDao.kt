@@ -19,4 +19,13 @@ interface AddressDao {
 
     @Query("SELECT COUNT(*) FROM addresses")
     suspend fun getCount(): Int
+    @Query("SELECT * FROM addresses WHERE colony LIKE '%' || :name || '%' OR street LIKE '%' || :name || '%' LIMIT 1")
+    suspend fun findByName(name: String): Address?
+    @Query("""
+    SELECT * FROM addresses 
+    ORDER BY ((lat - :lat) * (lat - :lat) + (lng - :lng) * (lng - :lng)) ASC 
+    LIMIT 5
+""")
+    suspend fun getNearbyAddresses(lat: Double, lng: Double): List<Address>
 }
+

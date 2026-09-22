@@ -25,6 +25,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material3.Button
@@ -33,6 +34,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextField
 import androidx.compose.runtime.Composable
@@ -42,9 +44,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -92,6 +96,9 @@ fun MainScreen(modifier: Modifier = Modifier) {
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         item {
+            OfflineBadge()
+        }
+        item {
             LocationScreenContent(
                 onLocationUpdated = { location ->
                     currentLocation = location
@@ -107,6 +114,22 @@ fun MainScreen(modifier: Modifier = Modifier) {
         item {
             LlmTestContent(closestAddress = closestAddress)
         }
+    }
+}
+
+@Composable
+fun OfflineBadge() {
+    Surface(
+        color = Color(0xFF1B5E20),
+        shape = RoundedCornerShape(20.dp),
+        modifier = Modifier.padding(8.dp)
+    ) {
+        Text(
+            text = "🔒 100% Offline — No Internet Used",
+            color = Color.White,
+            style = MaterialTheme.typography.labelMedium,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+        )
     }
 }
 
@@ -142,7 +165,6 @@ fun LocationScreenContent(
             locationInfo = "Lat: ${location.latitude}, Long: ${location.longitude}"
             onLocationUpdated(location)
 
-            // Query closest address
             coroutineScope.launch {
                 val db = AppDatabase.getDatabase(context)
                 val address = db.addressDao().getClosestAddress(location.latitude, location.longitude)
@@ -198,13 +220,18 @@ fun LlmTestContent(closestAddress: Address? = null) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val llmHelper = remember { LlmInferenceHelper(context) }
-    
+    val currentAddress by rememberUpdatedState(closestAddress)
+
     var ttsInstance by remember { mutableStateOf<TextToSpeech?>(null) }
-    
+
     DisposableEffect(Unit) {
         val tts = TextToSpeech(context) { status ->
             if (status == TextToSpeech.SUCCESS) {
-                ttsInstance?.language = Locale.US
+                val indianLocale = Locale("en", "IN")
+                val result = ttsInstance?.setLanguage(indianLocale)
+                if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                    ttsInstance?.language = Locale.US
+                }
             }
         }
         ttsInstance = tts
@@ -245,7 +272,6 @@ fun LlmTestContent(closestAddress: Address? = null) {
                     llmHelper.init(modelPath)
                     val result = llmHelper.generateResponse(prompt)
                     response = result
-                    // Speak the response aloud
                     ttsInstance?.speak(result, TextToSpeech.QUEUE_FLUSH, null, null)
                 } catch (e: Exception) {
                     response = "Error: ${e.message}"
@@ -276,8 +302,70 @@ fun LlmTestContent(closestAddress: Address? = null) {
             override fun onResults(results: Bundle?) {
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 if (!matches.isNullOrEmpty()) {
-                    prompt = matches[0]
-                    runInference()
+                    val recognizedText = matches[0]
+                    val address = currentAddress
+
+                    if (recognizedText.contains("emergency", ignoreCase = true) || recognizedText.contains("send my location", ignoreCase = true)) {
+                        val message = if (address != null) {
+                            "EMERGENCY: I am near ${address.street}, ${address.colony}, ${address.city}."
+                        } else {
+                            "EMERGENCY: Location unavailable."
+                        }
+                        val smsIntent = Intent(Intent.ACTION_SENDTO).apply {
+                            data = android.net.Uri.parse("smsto:8309036268")
+                            putExtra("sms_body", message)
+                        }
+                        context.startActivity(smsIntent)
+                        response = "Opening emergency SMS..."
+                        return
+                    }
+
+                    if (recognizedText.contains("how far", ignoreCase = true) || recognizedText.contains("distance to", ignoreCase = true)) {
+                        coroutineScope.launch {
+                            val db = AppDatabase.getDatabase(context)
+                            val targetName = recognizedText
+                                .replace("how far is", "", ignoreCase = true)
+                                .replace("how far to", "", ignoreCase = true)
+                                .replace("distance to", "", ignoreCase = true)
+                                .trim()
+                            val target = db.addressDao().findByName(targetName)
+                            val current = address
+                            if (target != null && current != null) {
+                                val dist = haversineDistance(current.lat, current.lng, target.lat, target.lng)
+                                val distText = "You are approximately %.1f kilometers from %s.".format(dist, target.colony)
+                                response = distText
+                                ttsInstance?.speak(distText, TextToSpeech.QUEUE_FLUSH, null, null)
+                            } else {
+                                val notFound = "Sorry, I couldn't find that location in my data."
+                                response = notFound
+                                ttsInstance?.speak(notFound, TextToSpeech.QUEUE_FLUSH, null, null)
+                            }
+                        }
+                        return
+                    }
+
+                    if (address == null) {
+                        prompt = recognizedText
+                        response = "Location is not yet available."
+                        ttsInstance?.speak("Location is not yet available.", TextToSpeech.QUEUE_FLUSH, null, null)
+                    } else {
+                        val fullPrompt = "You are a friendly, natural-sounding Indian voice assistant, like a helpful local friend. The user's current location is: ${address.street}, ${address.colony}, ${address.city}. The user said: \"$recognizedText\". Reply in one or two natural, conversational sentences — warm and clear, not robotic. Avoid repeating the coordinates. Just talk like a real person would."
+                        prompt = fullPrompt
+                        coroutineScope.launch {
+                            isLoading = true
+                            response = "Asking local guide..."
+                            try {
+                                llmHelper.init(modelPath)
+                                val result = llmHelper.generateResponse(fullPrompt)
+                                response = result
+                                ttsInstance?.speak(result, TextToSpeech.QUEUE_FLUSH, null, null)
+                            } catch (e: Exception) {
+                                response = "Error: ${e.message}"
+                            } finally {
+                                isLoading = false
+                            }
+                        }
+                    }
                 }
             }
             override fun onPartialResults(partialResults: Bundle?) {}
@@ -298,7 +386,7 @@ fun LlmTestContent(closestAddress: Address? = null) {
 
     LaunchedEffect(closestAddress) {
         closestAddress?.let { address ->
-            prompt = "You are a location assistant. The user's current location is: ${address.street}, ${address.colony}, ${address.city}. Write one short, friendly sentence confirming their location. Do not ask questions. Example format: You are near [location], a [description]. Now generate a similar sentence for the given location."
+            prompt = "You are a friendly, natural-sounding Indian voice assistant, like a helpful local friend. The user's current location is: ${address.street}, ${address.colony}, ${address.city}. Greet them warmly and let them know where they are, in one or two natural conversational sentences. Do not ask questions. Do not repeat coordinates."
             runInference()
         }
     }
@@ -404,6 +492,17 @@ fun LocationUpdates(
             fusedLocationClient.removeLocationUpdates(locationCallback)
         }
     }
+}
+
+fun haversineDistance(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+    val R = 6371.0
+    val dLat = Math.toRadians(lat2 - lat1)
+    val dLon = Math.toRadians(lon2 - lon1)
+    val a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+            Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2)) *
+            Math.sin(dLon / 2) * Math.sin(dLon / 2)
+    val c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+    return R * c
 }
 
 @Preview(showBackground = true)
